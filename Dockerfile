@@ -32,7 +32,11 @@ COPY --from=builder /app/websocket-service .
 COPY --from=builder /app/config ./config
 
 # Expose the HTTP and gRPC ports
-EXPOSE 8080 9090
+EXPOSE 8083 9093
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8083/health || exit 1
 
 # Set the entry point
 ENTRYPOINT ["./websocket-service"]

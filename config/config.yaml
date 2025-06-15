@@ -1,0 +1,26 @@
+logLevel: info
+httpPort: 8083
+grpcPort: 9093
+
+websocket:
+  readBufferSize: 1024
+  writeBufferSize: 1024
+  checkOrigin: false
+  allowedOrigins: ["*"]
+
+metrics:
+  enabled: true
+  endpoint: /metrics
+
+security:
+  corsAllowedOrigins: "*"
+  rateLimit:
+    enabled: true
+    requestsPerSecond: 100
+
+delta:
+  enabled: true
+  wsURL: "wss://socket.india.delta.exchange"
+  reconnectInterval: 5
+  maxReconnectAttempts: 3
+  connectionTimeout: 10 

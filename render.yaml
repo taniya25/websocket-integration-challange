@@ -9,11 +9,21 @@ services:
       - key: LOG_LEVEL
         value: info
       - key: HTTP_PORT
-        value: 8080
+        value: 8083
       - key: GRPC_PORT
-        value: 9090
+        value: 9093
+      - key: ENVIRONMENT
+        value: production
     ports:
-      - port: 8080
+      - port: 8083
         protocol: http
-      - port: 9090
-        protocol: tcp 
+      - port: 9093
+        protocol: tcp
+    headers:
+      - path: /*
+        name: Upgrade
+        value: $http_upgrade
+      - path: /*
+        name: Connection
+        value: $connection_upgrade
+    autoDeploy: true 

@@ -2,7 +2,6 @@ package config
 
 import (
 	"log"
-	"strings"
 )
 
 // Delta represents the configuration for the Delta Exchange websocket
@@ -25,15 +24,16 @@ type Config struct {
 
 	// Websocket configuration
 	Websocket struct {
-		ReadBufferSize  int   `mapstructure:"read_buffer_size"`
-		WriteBufferSize int   `mapstructure:"write_buffer_size"`
+		ReadBufferSize  int   `yaml:"readBufferSize"`
+		WriteBufferSize int   `yaml:"writeBufferSize"`
 		MaxMessageSize  int64 `mapstructure:"max_message_size"`
-		CheckOrigin     bool  `mapstructure:"check_origin"`
+		CheckOrigin     bool  `yaml:"checkOrigin"`
 		Auth            struct {
 			Required bool   `mapstructure:"required"`
 			Secret   string `mapstructure:"secret"`
 		} `mapstructure:"auth"`
-	} `mapstructure:"websocket"`
+		AllowedOrigins []string `yaml:"allowedOrigins"`
+	} `yaml:"websocket"`
 
 	// Security configuration
 	Security struct {
@@ -91,8 +91,8 @@ func LoadConfig(serviceName string) (*Config, error) {
 
 // GetCORSAllowedOrigins returns the allowed origins for CORS
 func (c *Config) GetCORSAllowedOrigins() []string {
-	if c.Security.CORSAllowedOrigins == "" {
-		return []string{"*"}
+	if len(c.Websocket.AllowedOrigins) == 0 {
+		return []string{"*"} // Allow all origins if none specified
 	}
-	return strings.Split(c.Security.CORSAllowedOrigins, ",")
+	return c.Websocket.AllowedOrigins
 }
