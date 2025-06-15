@@ -87,9 +87,15 @@ func (l *Logger) LogSubscription(clientID, channel string, productIDs []string) 
 
 // LogError logs an error event
 func (l *Logger) LogError(eventType string, err error, metadata map[string]interface{}) {
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	} else {
+		errMsg = ""
+	}
 	l.LogEvent(Event{
 		EventType: eventType,
-		Error:     err.Error(),
+		Error:     errMsg,
 		Metadata:  metadata,
 	})
 }

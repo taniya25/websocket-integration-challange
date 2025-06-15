@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -71,6 +72,44 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
+	})
+
+	// Add subscription stats endpoint
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := websocketHandler.GetStatistics()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	// Add test broadcast endpoint
+	mux.HandleFunc("/test-broadcast", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get channel and product ID from query parameters
+		channel := r.URL.Query().Get("channel")
+		if channel == "" {
+			channel = "test" // default channel
+		}
+		productID := r.URL.Query().Get("product_id")
+		if productID == "" {
+			productID = "BTC-USD" // default product ID
+		}
+
+		// Create a test message
+		message := []byte(fmt.Sprintf(`{"type":"test","data":"test message for %s","product_id":"%s"}`, channel, productID))
+
+		// Broadcast to all subscribed clients
+		websocketHandler.BroadcastToChannel(channel, message, productID)
+
+		// Log the broadcast
+		log.Printf("Test broadcast sent to channel '%s' with product ID '%s'", channel, productID)
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(fmt.Sprintf("Broadcast sent to channel '%s' with product ID '%s'", channel, productID)))
 	})
 
 	// Add metrics endpoint if enabled

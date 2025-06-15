@@ -13,6 +13,14 @@ type Delta struct {
 	ReconnectMax int      `mapstructure:"reconnect_max"`
 }
 
+// WebsocketConfig holds WebSocket server configuration
+type WebsocketConfig struct {
+	ReadBufferSize  int      `yaml:"readBufferSize"`
+	WriteBufferSize int      `yaml:"writeBufferSize"`
+	CheckOrigin     bool     `yaml:"checkOrigin"`
+	AllowedOrigins  []string `yaml:"allowedOrigins"`
+}
+
 // Config represents the configuration for the websocket service
 type Config struct {
 	// Service configuration
@@ -23,17 +31,7 @@ type Config struct {
 	GRPCPort    int    `mapstructure:"grpc_port"`
 
 	// Websocket configuration
-	Websocket struct {
-		ReadBufferSize  int   `yaml:"readBufferSize"`
-		WriteBufferSize int   `yaml:"writeBufferSize"`
-		MaxMessageSize  int64 `mapstructure:"max_message_size"`
-		CheckOrigin     bool  `yaml:"checkOrigin"`
-		Auth            struct {
-			Required bool   `mapstructure:"required"`
-			Secret   string `mapstructure:"secret"`
-		} `mapstructure:"auth"`
-		AllowedOrigins []string `yaml:"allowedOrigins"`
-	} `yaml:"websocket"`
+	Websocket WebsocketConfig `yaml:"websocket"`
 
 	// Security configuration
 	Security struct {

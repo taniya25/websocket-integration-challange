@@ -25,18 +25,32 @@ const (
 	// Send pings to peer with this period
 	pingPeriod = (pongWait * 9) / 10
 
-	// Maximum message size allowed from peer
+	// Maximum message size allowed from peer.
 	maxMessageSize = 512 * 1024 // 512KB
+
+	// Maximum number of messages in the send channel
+	maxSendChannelSize = 256
 
 	// Maximum number of messages that can be queued for a client
 	maxMessageQueue = 1000
 )
 
-// Client represents a connected websocket client
+// Client is a middleman between the websocket connection and the hub.
 type Client struct {
-	conn           *websocket.Conn
-	send           chan []byte
-	subscriptions  map[string]bool
+	hub *WebsocketHandler
+
+	// The websocket connection.
+	conn *websocket.Conn
+
+	// Buffered channel of outbound messages.
+	send chan []byte
+
+	// Subscribed channels
+	subscribedChannels map[string]bool
+
+	// Mutex for subscribedChannels
+	subMutex sync.RWMutex
+
 	productFilters map[string][]string
 	mu             sync.RWMutex
 	id             string
@@ -125,13 +139,12 @@ func (h *WebsocketHandler) HandleWebsocket(w http.ResponseWriter, r *http.Reques
 	}
 
 	client := &Client{
-		conn:           conn,
-		send:           make(chan []byte, h.MaxMessageQueue),
-		subscriptions:  make(map[string]bool),
-		productFilters: make(map[string][]string),
-		id:             fmt.Sprintf("%d", time.Now().UnixNano()),
-		connectedAt:    time.Now(),
-		lastActivity:   time.Now(),
+		conn:               conn,
+		send:               make(chan []byte, h.MaxMessageQueue),
+		subscribedChannels: make(map[string]bool),
+		id:                 fmt.Sprintf("%d", time.Now().UnixNano()),
+		connectedAt:        time.Now(),
+		lastActivity:       time.Now(),
 	}
 
 	h.logger.LogConnection(client.id, map[string]interface{}{
@@ -314,163 +327,72 @@ func (h *WebsocketHandler) run() {
 	}
 }
 
-// readPump pumps messages from the websocket connection to the hub
-func (h *WebsocketHandler) readPump(client *Client) {
-	defer func() {
-		h.unregister <- client
-		client.conn.Close()
-	}()
-
-	client.conn.SetReadLimit(maxMessageSize)
-	client.conn.SetReadDeadline(time.Now().Add(pongWait))
-	client.conn.SetPongHandler(func(string) error {
-		client.conn.SetReadDeadline(time.Now().Add(pongWait))
-		client.lastActivity = time.Now()
-		return nil
-	})
-
-	for {
-		_, message, err := client.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				h.logger.LogError("read_error", err, map[string]interface{}{
-					"client_id": client.id,
-				})
-			}
-			break
-		}
-
-		client.lastActivity = time.Now()
-		atomic.AddInt64(&h.messagesReceived, 1)
-
-		var msg map[string]interface{}
-		if err := json.Unmarshal(message, &msg); err != nil {
-			h.logger.LogError("message_parse_error", err, map[string]interface{}{
-				"client_id": client.id,
-				"message":   string(message),
-			})
-			continue
-		}
-
-		msgType, ok := msg["type"].(string)
-		if !ok {
-			continue
-		}
-
-		switch msgType {
-		case "subscribe":
-			h.handleSubscribe(client, msg)
-		case "unsubscribe":
-			h.handleUnsubscribe(client, msg)
-		case "ping":
-			h.handlePing(client)
-		}
+// sendError sends an error message to the client
+func (h *WebsocketHandler) sendError(client *Client, errorType string, err error, metadata map[string]interface{}) {
+	response := map[string]interface{}{
+		"type":    "error",
+		"error":   errorType,
+		"message": err.Error(),
 	}
-}
-
-// writePump pumps messages from the hub to the websocket connection
-func (h *WebsocketHandler) writePump(client *Client) {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		h.logger.LogDisconnection(client.id, "writePump_exit")
-		client.conn.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-client.send:
-			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// The send channel was closed.
-				h.logger.LogInfo("writePump_send_channel_closed", map[string]interface{}{"client_id": client.id})
-				client.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			w, err := client.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				h.logger.LogError("writePump_next_writer_error", err, map[string]interface{}{"client_id": client.id})
-				return
-			}
-			w.Write(message)
-
-			// Drain the send channel to avoid blocking
-			for {
-				select {
-				case msg, ok := <-client.send:
-					if !ok {
-						break
-					}
-					w.Write([]byte("\n"))
-					w.Write(msg)
-				default:
-					break
-				}
-			}
-
-			if err := w.Close(); err != nil {
-				h.logger.LogError("writePump_writer_close_error", err, map[string]interface{}{"client_id": client.id})
-				return
-			}
-		case <-ticker.C:
-			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				h.logger.LogError("writePump_ping_error", err, map[string]interface{}{"client_id": client.id})
-				return
-			}
-		}
+	if metadata != nil {
+		response["metadata"] = metadata
 	}
-}
 
-// cleanupStaleConnections periodically cleans up stale connections
-func (h *WebsocketHandler) cleanupStaleConnections() {
-	ticker := time.NewTicker(h.CleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			h.clientsMu.Lock()
-			for client := range h.clients {
-				if time.Since(client.lastActivity) > pongWait*2 {
-					h.logger.LogDisconnection(client.id, "stale_connection")
-					h.unregister <- client
-				}
-			}
-			h.clientsMu.Unlock()
-		case <-h.ctx.Done():
-			return
-		}
-	}
-}
-
-// handleSubscribe handles a subscribe message
-func (h *WebsocketHandler) handleSubscribe(client *Client, msg map[string]interface{}) {
-	channel, ok := msg["channel"].(string)
-	if !ok {
-		h.logger.LogError("subscribe_error", fmt.Errorf("channel not found in message"), map[string]interface{}{
-			"client_id": client.id,
-			"message":   msg,
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		h.logger.LogError("error_marshal_failed", err, map[string]interface{}{
+			"client_id":  client.id,
+			"error_type": errorType,
 		})
 		return
 	}
 
-	var productIDs []string
-	if products, ok := msg["product_ids"].([]interface{}); ok {
-		for _, p := range products {
-			if pid, ok := p.(string); ok {
-				productIDs = append(productIDs, pid)
-			}
-		}
+	select {
+	case client.send <- responseBytes:
+		h.logger.LogError(errorType, err, metadata)
+	default:
+		h.unregister <- client
 	}
+}
 
-	h.subscribeClient(client, channel, productIDs)
-	h.logger.LogSubscription(client.id, channel, productIDs)
+// handleSubscribe handles a subscribe message
+func (h *WebsocketHandler) handleSubscribe(client *Client, channel string) {
+	// Check if already subscribed
+	client.subMutex.RLock()
+	if client.subscribedChannels[channel] {
+		client.subMutex.RUnlock()
+		h.sendError(client, "subscribe_error", fmt.Errorf("already subscribed to channel"), map[string]interface{}{
+			"client_id": client.id,
+			"channel":   channel,
+		})
+		return
+	}
+	client.subMutex.RUnlock()
+
+	h.logger.LogInfo("subscribe_processing", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
+
+	h.subscribeClient(client, channel)
+	h.logger.LogSubscription(client.id, channel, []string{})
+
+	// Send success response
+	response := map[string]interface{}{
+		"type":    "subscribe_success",
+		"channel": channel,
+	}
+	responseBytes, _ := json.Marshal(response)
+	client.send <- responseBytes
+
+	h.logger.LogInfo("subscribe_complete", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
 }
 
 // subscribeClient subscribes a client to a channel
-func (h *WebsocketHandler) subscribeClient(client *Client, channel string, productIDs []string) {
+func (h *WebsocketHandler) subscribeClient(client *Client, channel string) {
 	h.subscriptionsMu.Lock()
 	defer h.subscriptionsMu.Unlock()
 
@@ -484,45 +406,75 @@ func (h *WebsocketHandler) subscribeClient(client *Client, channel string, produ
 
 	// Update the client's subscriptions
 	client.mu.Lock()
-	client.subscriptions[channel] = true
-	if len(productIDs) > 0 {
-		client.productFilters[channel] = productIDs
-	}
+	client.subscribedChannels[channel] = true
 	client.mu.Unlock()
 }
 
 // handleUnsubscribe handles an unsubscribe message
-func (h *WebsocketHandler) handleUnsubscribe(client *Client, msg map[string]interface{}) {
-	channel, ok := msg["channel"].(string)
-	if !ok {
-		h.logger.LogError("unsubscribe_error", fmt.Errorf("channel not found in message"), map[string]interface{}{
+func (h *WebsocketHandler) handleUnsubscribe(client *Client, channel string) {
+	h.logger.LogInfo("unsubscribe_request", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
+
+	// Check if subscribed
+	client.mu.RLock()
+	if !client.subscribedChannels[channel] {
+		client.mu.RUnlock()
+		h.sendError(client, "unsubscribe_error", fmt.Errorf("not subscribed to channel"), map[string]interface{}{
 			"client_id": client.id,
-			"message":   msg,
+			"channel":   channel,
 		})
 		return
 	}
+	client.mu.RUnlock()
+
+	h.logger.LogInfo("unsubscribe_processing", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
 
 	h.unsubscribeClient(client, channel)
+
+	// Send success response
+	response := map[string]interface{}{
+		"type":    "unsubscribed",
+		"channel": channel,
+	}
+	responseBytes, _ := json.Marshal(response)
+	client.send <- responseBytes
+
+	h.logger.LogInfo("unsubscribe_complete", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
 }
 
 // unsubscribeClient unsubscribes a client from a channel
 func (h *WebsocketHandler) unsubscribeClient(client *Client, channel string) {
-	h.subscriptionsMu.Lock()
-	defer h.subscriptionsMu.Unlock()
+	h.logger.LogInfo("unsubscribe_client_start", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
 
-	// Remove the client from the channel
+	client.mu.Lock()
+	delete(client.subscribedChannels, channel)
+	delete(client.productFilters, channel)
+	client.mu.Unlock()
+
+	h.subscriptionsMu.Lock()
 	if clients, ok := h.subscriptions[channel]; ok {
 		delete(clients, client)
 		if len(clients) == 0 {
 			delete(h.subscriptions, channel)
 		}
 	}
+	h.subscriptionsMu.Unlock()
 
-	// Update the client's subscriptions
-	client.mu.Lock()
-	delete(client.subscriptions, channel)
-	delete(client.productFilters, channel)
-	client.mu.Unlock()
+	h.logger.LogInfo("unsubscribe_client_complete", map[string]interface{}{
+		"client_id": client.id,
+		"channel":   channel,
+	})
 }
 
 // handlePing handles a ping message
@@ -548,5 +500,126 @@ func (h *WebsocketHandler) handlePing(client *Client) {
 	case client.send <- responseBytes:
 	default:
 		h.unregister <- client
+	}
+}
+
+// readPump pumps messages from the websocket connection to the hub
+func (h *WebsocketHandler) readPump(client *Client) {
+	defer func() {
+		h.unregister <- client
+		client.conn.Close()
+	}()
+
+	client.conn.SetReadLimit(maxMessageSize)
+	client.conn.SetReadDeadline(time.Now().Add(pongWait))
+	client.conn.SetPongHandler(func(string) error {
+		client.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	for {
+		_, message, err := client.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				h.logger.LogError("websocket read error", err, nil)
+			}
+			break
+		}
+
+		var msg map[string]interface{}
+		if err := json.Unmarshal(message, &msg); err != nil {
+			h.sendError(client, "message_parse_error", err, nil)
+			continue
+		}
+
+		msgType, ok := msg["type"].(string)
+		if !ok {
+			h.sendError(client, "invalid_message_type", fmt.Errorf("type field missing or invalid"), nil)
+			continue
+		}
+
+		switch msgType {
+		case "subscribe":
+			channel, ok := msg["channel"].(string)
+			if !ok {
+				h.sendError(client, "subscribe_error", fmt.Errorf("channel field missing or invalid"), nil)
+				continue
+			}
+			h.handleSubscribe(client, channel)
+		case "unsubscribe":
+			channel, ok := msg["channel"].(string)
+			if !ok {
+				h.sendError(client, "unsubscribe_error", fmt.Errorf("channel field missing or invalid"), nil)
+				continue
+			}
+			h.handleUnsubscribe(client, channel)
+		default:
+			h.sendError(client, "invalid_message_type", fmt.Errorf("unknown message type: %s", msgType), nil)
+		}
+	}
+}
+
+// writePump pumps messages from the hub to the websocket connection
+func (h *WebsocketHandler) writePump(client *Client) {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		client.conn.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-client.send:
+			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// The hub closed the channel.
+				client.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			w, err := client.conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(message)
+
+			// Add queued messages to the current websocket message.
+			n := len(client.send)
+			for i := 0; i < n; i++ {
+				w.Write([]byte{'\n'})
+				w.Write(<-client.send)
+			}
+
+			if err := w.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// cleanupStaleConnections periodically cleans up stale connections
+func (h *WebsocketHandler) cleanupStaleConnections() {
+	ticker := time.NewTicker(h.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			h.clientsMu.Lock()
+			for client := range h.clients {
+				if time.Since(client.lastActivity) > pongWait*2 {
+					h.logger.LogDisconnection(client.id, "stale_connection")
+					h.unregister <- client
+				}
+			}
+			h.clientsMu.Unlock()
+		case <-h.ctx.Done():
+			return
+		}
 	}
 }
