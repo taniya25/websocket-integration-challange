@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: websocket-service
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    healthCheckPath: /health
+    envVars:
+      - key: LOG_LEVEL
+        value: info
+      - key: HTTP_PORT
+        value: 8080
+      - key: GRPC_PORT
+        value: 9090
+    ports:
+      - port: 8080
+        protocol: http
+      - port: 9090
+        protocol: tcp 

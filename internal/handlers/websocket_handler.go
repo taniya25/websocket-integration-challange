@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -12,7 +11,25 @@ import (
 
 	"github.com/Cryptovate-India/websocket-service/internal/clients"
 	"github.com/Cryptovate-India/websocket-service/internal/config"
+	"github.com/Cryptovate-India/websocket-service/internal/telemetry"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// Time allowed to write a message to the peer
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer
+	maxMessageSize = 512 * 1024 // 512KB
+
+	// Maximum number of messages that can be queued for a client
+	maxMessageQueue = 1000
 )
 
 // Client represents a connected websocket client
@@ -25,6 +42,7 @@ type Client struct {
 	id             string
 	connectedAt    time.Time
 	lastActivity   time.Time
+	reconnectCount int
 }
 
 // WebsocketHandler handles websocket connections
@@ -43,6 +61,9 @@ type WebsocketHandler struct {
 	cancel           context.CancelFunc
 	messagesSent     int64
 	messagesReceived int64
+	logger           *telemetry.Logger
+	CleanupInterval  time.Duration
+	MaxMessageQueue  int
 }
 
 // NewWebsocketHandler creates a new websocket handler
@@ -58,7 +79,6 @@ func NewWebsocketHandler(ctx context.Context, cfg *config.Config) *WebsocketHand
 				if !cfg.Websocket.CheckOrigin {
 					return true
 				}
-				// Check the origin against the allowed origins
 				origin := r.Header.Get("Origin")
 				for _, allowedOrigin := range cfg.GetCORSAllowedOrigins() {
 					if allowedOrigin == "*" || allowedOrigin == origin {
@@ -68,56 +88,45 @@ func NewWebsocketHandler(ctx context.Context, cfg *config.Config) *WebsocketHand
 				return false
 			},
 		},
-		clients:       make(map[*Client]bool),
-		broadcast:     make(chan []byte),
-		register:      make(chan *Client),
-		unregister:    make(chan *Client),
-		subscriptions: make(map[string]map[*Client]bool),
-		config:        cfg,
-		ctx:           handlerCtx,
-		cancel:        cancel,
+		clients:         make(map[*Client]bool),
+		broadcast:       make(chan []byte, 1000),
+		register:        make(chan *Client, 100),
+		unregister:      make(chan *Client, 100),
+		subscriptions:   make(map[string]map[*Client]bool),
+		config:          cfg,
+		ctx:             handlerCtx,
+		cancel:          cancel,
+		logger:          telemetry.NewLogger(),
+		CleanupInterval: time.Minute,
+		MaxMessageQueue: 1000,
 	}
-
-	fmt.Println("Websocket handler created")
-	fmt.Println("Websocket handler config:", cfg)
-	fmt.Println("Websocket handler context:", handlerCtx)
 
 	// Create the Delta Exchange client if enabled
 	if cfg.Delta.Enabled {
 		handler.deltaClient = clients.NewDeltaWebsocketClient(handlerCtx, &cfg.Delta)
-
-		// // Register handlers for Delta Exchange channels
-		// for _, channel := range cfg.Delta.Channels {
-		// 	handler.registerDeltaHandler(channel)
-		// }
-
-		fmt.Println("WS_handler:ctor: Delta Exchange client created")
-
-		// Connect to Delta Exchange
 		if err := handler.deltaClient.Connect(); err != nil {
-			fmt.Println("Failed to connect to Delta Exchange: ", err)
+			handler.logger.LogError("delta_connection", err, nil)
 		}
 	}
 
 	// Start the handler
 	go handler.run()
+	go handler.cleanupStaleConnections()
 
 	return handler
 }
 
 // HandleWebsocket handles a websocket connection
 func (h *WebsocketHandler) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
-	// Upgrade the connection to a websocket
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Failed to upgrade connection: %v", err)
+		h.logger.LogError("connection_upgrade", err, nil)
 		return
 	}
 
-	// Create a new client
 	client := &Client{
 		conn:           conn,
-		send:           make(chan []byte, 256),
+		send:           make(chan []byte, h.MaxMessageQueue),
 		subscriptions:  make(map[string]bool),
 		productFilters: make(map[string][]string),
 		id:             fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -125,44 +134,38 @@ func (h *WebsocketHandler) HandleWebsocket(w http.ResponseWriter, r *http.Reques
 		lastActivity:   time.Now(),
 	}
 
-	// Register the client
+	h.logger.LogConnection(client.id, map[string]interface{}{
+		"remote_addr": r.RemoteAddr,
+		"user_agent":  r.UserAgent(),
+	})
+
 	h.register <- client
 
-	// Start the read and write pumps
 	go h.readPump(client)
 	go h.writePump(client)
 }
 
 // BroadcastToChannel broadcasts a message to all clients subscribed to a channel
 func (h *WebsocketHandler) BroadcastToChannel(channel string, message []byte, productID string) {
-	// Get the clients subscribed to the channel
+	startTime := time.Now()
+
 	h.subscriptionsMu.RLock()
-	// fmt.Println("WS_Handler: Broadcase: Broadcasting to channel:", channel)
-	// fmt.Println("WS_Handler: Broadcast: total subscribers:", len(h.subscriptions))
-	// Get the list of clients subscribed to the channel
 	clients, ok := h.subscriptions[channel]
 	h.subscriptionsMu.RUnlock()
+
 	if !ok {
 		return
 	}
 
-	// Broadcast the message to all clients subscribed to the channel
 	for client := range clients {
-		// Check if the client has a product filter for the channel
 		client.mu.RLock()
 		clientProductIDs, hasFilter := client.productFilters[channel]
 		client.mu.RUnlock()
 
-		// fmt.Println("WS_Handler: Broadcast: reading product ids:", clientProductIDs)
-
-		// If the client has a product filter, check if the message matches the filter
 		if hasFilter && len(clientProductIDs) > 0 {
-			// Check if any of the product IDs match
-			fmt.Println("WS_Handler: Broadcast: checking product ids:", productID, "in clientProductIDs:", clientProductIDs)
 			match := false
 			for _, clientProductID := range clientProductIDs {
 				if productID == clientProductID {
-					fmt.Println("WS_Handler: Broadcast: found a match for product id:", productID, "in clientProductIDs:", clientProductIDs)
 					match = true
 					break
 				}
@@ -172,13 +175,20 @@ func (h *WebsocketHandler) BroadcastToChannel(channel string, message []byte, pr
 			}
 		}
 
-		fmt.Println("WS_Handler: Broadcast: sending message to client:", client.id, "on channel:", channel, "for product:", productID)
-
-		// Send the message to the client
 		select {
 		case client.send <- message:
+			h.logger.LogInfo("broadcast_send_success", map[string]interface{}{"client_id": client.id})
+			h.logger.LogMessage(client.id, channel, productID, len(message), time.Since(startTime))
+			atomic.AddInt64(&h.messagesSent, 1)
 		default:
+			h.logger.LogInfo("broadcast_send_queue_full", map[string]interface{}{"client_id": client.id})
+			h.logger.LogError("message_queue_full", fmt.Errorf("client message queue full"), map[string]interface{}{
+				"client_id": client.id,
+				"channel":   channel,
+			})
+			h.logger.LogInfo("broadcast_unreg_start", map[string]interface{}{"client_id": client.id})
 			h.unregister <- client
+			h.logger.LogInfo("broadcast_unreg_sent", map[string]interface{}{"client_id": client.id})
 		}
 	}
 }
@@ -265,14 +275,15 @@ func (h *WebsocketHandler) run() {
 		case client := <-h.register:
 			h.clientsMu.Lock()
 			h.clients[client] = true
+			h.logger.LogInfo("client_registered", map[string]interface{}{"client_id": client.id})
 			h.clientsMu.Unlock()
 		case client := <-h.unregister:
 			h.clientsMu.Lock()
-			fmt.Println("WS_Handler: unregistering client")
-
+			h.logger.LogInfo("unregistering_client", map[string]interface{}{"client_id": client.id})
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				h.logger.LogInfo("client_removed_from_map", map[string]interface{}{"client_id": client.id})
 			}
 			h.clientsMu.Unlock()
 
@@ -303,17 +314,18 @@ func (h *WebsocketHandler) run() {
 	}
 }
 
-// readPump reads messages from the client
+// readPump pumps messages from the websocket connection to the hub
 func (h *WebsocketHandler) readPump(client *Client) {
 	defer func() {
 		h.unregister <- client
 		client.conn.Close()
 	}()
 
-	client.conn.SetReadLimit(h.config.Websocket.MaxMessageSize)
-	client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	client.conn.SetReadLimit(maxMessageSize)
+	client.conn.SetReadDeadline(time.Now().Add(pongWait))
 	client.conn.SetPongHandler(func(string) error {
-		client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		client.conn.SetReadDeadline(time.Now().Add(pongWait))
+		client.lastActivity = time.Now()
 		return nil
 	})
 
@@ -321,289 +333,220 @@ func (h *WebsocketHandler) readPump(client *Client) {
 		_, message, err := client.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Error reading message: %v", err)
+				h.logger.LogError("read_error", err, map[string]interface{}{
+					"client_id": client.id,
+				})
 			}
 			break
 		}
 
-		// Update the last activity time
 		client.lastActivity = time.Now()
-
-		// Increment the messages received counter
 		atomic.AddInt64(&h.messagesReceived, 1)
 
-		// Parse the message
 		var msg map[string]interface{}
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("Error parsing message: %v", err)
+			h.logger.LogError("message_parse_error", err, map[string]interface{}{
+				"client_id": client.id,
+				"message":   string(message),
+			})
 			continue
 		}
 
-		// Handle the message based on the type
-		if msgType, ok := msg["type"].(string); ok {
-			switch msgType {
-			case "subscribe":
-				h.handleSubscribe(client, msg)
-			case "unsubscribe":
-				h.handleUnsubscribe(client, msg)
-			case "ping":
-				h.handlePing(client)
-			default:
-				log.Printf("Unknown message type: %s", msgType)
-			}
+		msgType, ok := msg["type"].(string)
+		if !ok {
+			continue
+		}
+
+		switch msgType {
+		case "subscribe":
+			h.handleSubscribe(client, msg)
+		case "unsubscribe":
+			h.handleUnsubscribe(client, msg)
+		case "ping":
+			h.handlePing(client)
 		}
 	}
 }
 
-// writePump writes messages to the client
+// writePump pumps messages from the hub to the websocket connection
 func (h *WebsocketHandler) writePump(client *Client) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
+		h.logger.LogDisconnection(client.id, "writePump_exit")
 		client.conn.Close()
 	}()
 
 	for {
 		select {
 		case message, ok := <-client.send:
-			client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// The hub closed the channel
+				// The send channel was closed.
+				h.logger.LogInfo("writePump_send_channel_closed", map[string]interface{}{"client_id": client.id})
 				client.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			w, err := client.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
+				h.logger.LogError("writePump_next_writer_error", err, map[string]interface{}{"client_id": client.id})
 				return
 			}
 			w.Write(message)
 
-			// Increment the messages sent counter
-			atomic.AddInt64(&h.messagesSent, 1)
-
-			// Add queued messages to the current websocket message
-			n := len(client.send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				msg := <-client.send
-				w.Write(msg)
-				// Increment the messages sent counter
-				atomic.AddInt64(&h.messagesSent, 1)
+			// Drain the send channel to avoid blocking
+			for {
+				select {
+				case msg, ok := <-client.send:
+					if !ok {
+						break
+					}
+					w.Write([]byte("\n"))
+					w.Write(msg)
+				default:
+					break
+				}
 			}
 
 			if err := w.Close(); err != nil {
+				h.logger.LogError("writePump_writer_close_error", err, map[string]interface{}{"client_id": client.id})
 				return
 			}
 		case <-ticker.C:
-			client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			client.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				h.logger.LogError("writePump_ping_error", err, map[string]interface{}{"client_id": client.id})
 				return
 			}
+		}
+	}
+}
+
+// cleanupStaleConnections periodically cleans up stale connections
+func (h *WebsocketHandler) cleanupStaleConnections() {
+	ticker := time.NewTicker(h.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			h.clientsMu.Lock()
+			for client := range h.clients {
+				if time.Since(client.lastActivity) > pongWait*2 {
+					h.logger.LogDisconnection(client.id, "stale_connection")
+					h.unregister <- client
+				}
+			}
+			h.clientsMu.Unlock()
+		case <-h.ctx.Done():
+			return
 		}
 	}
 }
 
 // handleSubscribe handles a subscribe message
 func (h *WebsocketHandler) handleSubscribe(client *Client, msg map[string]interface{}) {
-	fmt.Println("subscribing a message: ", msg)
+	channel, ok := msg["channel"].(string)
+	if !ok {
+		h.logger.LogError("subscribe_error", fmt.Errorf("channel not found in message"), map[string]interface{}{
+			"client_id": client.id,
+			"message":   msg,
+		})
+		return
+	}
 
-	var chName string = ""
-	// Check if the message has the new format with payload.channels
-	if payload, ok := msg["payload"].(map[string]interface{}); ok {
-		if channels, ok := payload["channels"].([]interface{}); ok {
-			// Process each channel in the payload
-			for _, channelObj := range channels {
-				if channelMap, ok := channelObj.(map[string]interface{}); ok {
-					// Get the channel name
-					channelName, ok := channelMap["name"].(string)
-					if !ok {
-						log.Printf("Channel object does not contain a name")
-						continue
-					}
-
-					// Get the symbols directly as product IDs
-					var productIDs []string
-					if symbols, ok := channelMap["symbols"].([]interface{}); ok {
-						for _, symbol := range symbols {
-							if symbolStr, ok := symbol.(string); ok {
-								if symbolStr == "all" {
-									// Use all product IDs from config
-									productIDs = []string{"all"}
-									break
-								} else {
-									// Add the symbol directly as a product ID
-									productIDs = append(productIDs, symbolStr)
-								}
-							} else if symbolFloat, ok := symbol.(float64); ok {
-								// Convert float to string
-								productIDs = append(productIDs, fmt.Sprintf("%v", symbolFloat))
-							}
-						}
-					}
-
-					fmt.Println("subscribing to channel: ", channelName)
-					fmt.Println("subscribing to product IDs: ", productIDs)
-					chName = channelName
-
-					// Check if deltaClient has not registered for this channel then register first.
-					if h.deltaClient != nil {
-						if channel, ok := msg["type"].(string); ok {
-							if channel == "subscribe" {
-								h.registerDeltaHandler(channelName)
-								fmt.Println("WS_handler: Delta: subscribing to channel: ", channelName)
-								h.deltaClient.Subscribe(channelName, productIDs)
-							}
-						}
-					}
-
-					// Subscribe the client to the channel
-					h.subscribeClient(client, channelName, productIDs)
-				}
+	var productIDs []string
+	if products, ok := msg["product_ids"].([]interface{}); ok {
+		for _, p := range products {
+			if pid, ok := p.(string); ok {
+				productIDs = append(productIDs, pid)
 			}
 		}
-	} else {
-		log.Printf("Subscribe message does not contain a payload")
-		return
 	}
 
-	// Send a subscription confirmation
-	response := map[string]interface{}{
-		"type": "subscribed",
-		"payload": map[string]interface{}{
-			"channels": []map[string]interface{}{
-				{
-					"name":    chName,
-					"symbols": []string{"all"},
-				},
-			},
-		},
-	}
-
-	data, err := json.Marshal(response)
-	if err != nil {
-		log.Printf("Error marshaling subscription confirmation: %v", err)
-		return
-	}
-
-	fmt.Println("sending subscription confirmation: ", string(data))
-
-	client.send <- data
-}
-
-// handleUnsubscribe handles an unsubscribe message
-func (h *WebsocketHandler) handleUnsubscribe(client *Client, msg map[string]interface{}) {
-	// Get the channel from the message
-	var chName string = ""
-	// Check if the message has the new format with payload.channels
-	if payload, ok := msg["payload"].(map[string]interface{}); ok {
-		if channels, ok := payload["channels"].([]interface{}); ok {
-			// Process each channel in the payload
-			for _, channelObj := range channels {
-				if channelMap, ok := channelObj.(map[string]interface{}); ok {
-					// Get the channel name
-					channelName, ok := channelMap["name"].(string)
-					if !ok {
-						log.Printf("Channel object does not contain a name")
-						continue
-					}
-
-					fmt.Println("subscribing to channel: ", channelName)
-					chName = channelName
-
-					if h.deltaClient != nil {
-						if channel, ok := msg["type"].(string); ok {
-							if channel == "unsubscribe" {
-								fmt.Println("WS_handler: Delta: unsubscribing from channel: ", channelName)
-								//check if no other subscriptions exist for this channel
-								if clients, ok := h.subscriptions[channelName]; ok {
-									if len(clients) == 0 {
-										// Unsubscribe the client from the channel
-										h.deltaClient.Unsubscribe(channelName)
-									} else {
-										fmt.Println("WS_handler: Delta: still ", len(clients), " clients subscribed to channel: ", channelName)
-									}
-								} else {
-									// Unsubscribe the client from the channel
-									h.deltaClient.Unsubscribe(channelName)
-									fmt.Println("WS_handler: Delta: unsubscribed from channel: ", channelName)
-								}
-							}
-						}
-					}
-					// Subscribe the client to the channel
-					h.unsubscribeClient(client, channelName)
-				}
-			}
-		}
-	} else {
-		log.Printf("Unsubscribe message does not contain a payload")
-		return
-	}
-
-	// Unsubscribe the client from the channel
-	// h.unsubscribeClient(client, channel)
-
-	// Send an unsubscription confirmation
-	response := map[string]interface{}{
-		"type":    "unsubscribed",
-		"channel": chName,
-	}
-	data, err := json.Marshal(response)
-	if err != nil {
-		log.Printf("Error marshaling unsubscription confirmation: %v", err)
-		return
-	}
-	client.send <- data
-}
-
-// handlePing handles a ping message
-func (h *WebsocketHandler) handlePing(client *Client) {
-	// Send a pong response
-	response := map[string]interface{}{
-		"type": "pong",
-		"time": time.Now().UnixNano() / int64(time.Millisecond),
-	}
-	data, err := json.Marshal(response)
-	if err != nil {
-		log.Printf("Error marshaling pong response: %v", err)
-		return
-	}
-	client.send <- data
+	h.subscribeClient(client, channel, productIDs)
+	h.logger.LogSubscription(client.id, channel, productIDs)
 }
 
 // subscribeClient subscribes a client to a channel
 func (h *WebsocketHandler) subscribeClient(client *Client, channel string, productIDs []string) {
-	// Add the subscription to the client
-	client.mu.Lock()
-	client.subscriptions[channel] = true
-	client.productFilters[channel] = productIDs
-	client.mu.Unlock()
-
-	// Add the client to the subscription
 	h.subscriptionsMu.Lock()
+	defer h.subscriptionsMu.Unlock()
+
+	// Create the channel if it doesn't exist
 	if _, ok := h.subscriptions[channel]; !ok {
 		h.subscriptions[channel] = make(map[*Client]bool)
 	}
+
+	// Add the client to the channel
 	h.subscriptions[channel][client] = true
-	h.subscriptionsMu.Unlock()
+
+	// Update the client's subscriptions
+	client.mu.Lock()
+	client.subscriptions[channel] = true
+	if len(productIDs) > 0 {
+		client.productFilters[channel] = productIDs
+	}
+	client.mu.Unlock()
+}
+
+// handleUnsubscribe handles an unsubscribe message
+func (h *WebsocketHandler) handleUnsubscribe(client *Client, msg map[string]interface{}) {
+	channel, ok := msg["channel"].(string)
+	if !ok {
+		h.logger.LogError("unsubscribe_error", fmt.Errorf("channel not found in message"), map[string]interface{}{
+			"client_id": client.id,
+			"message":   msg,
+		})
+		return
+	}
+
+	h.unsubscribeClient(client, channel)
 }
 
 // unsubscribeClient unsubscribes a client from a channel
 func (h *WebsocketHandler) unsubscribeClient(client *Client, channel string) {
-	// Remove the subscription from the client
-	client.mu.Lock()
-	delete(client.subscriptions, channel)
-	delete(client.productFilters, channel)
-	client.mu.Unlock()
-
-	// Remove the client from the subscription
 	h.subscriptionsMu.Lock()
+	defer h.subscriptionsMu.Unlock()
+
+	// Remove the client from the channel
 	if clients, ok := h.subscriptions[channel]; ok {
 		delete(clients, client)
 		if len(clients) == 0 {
 			delete(h.subscriptions, channel)
 		}
 	}
-	h.subscriptionsMu.Unlock()
+
+	// Update the client's subscriptions
+	client.mu.Lock()
+	delete(client.subscriptions, channel)
+	delete(client.productFilters, channel)
+	client.mu.Unlock()
+}
+
+// handlePing handles a ping message
+func (h *WebsocketHandler) handlePing(client *Client) {
+	client.mu.Lock()
+	client.lastActivity = time.Now()
+	client.mu.Unlock()
+
+	// Send pong response
+	response := map[string]interface{}{
+		"type": "pong",
+		"time": time.Now().UnixMilli(),
+	}
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		h.logger.LogError("ping_error", err, map[string]interface{}{
+			"client_id": client.id,
+		})
+		return
+	}
+
+	select {
+	case client.send <- responseBytes:
+	default:
+		h.unregister <- client
+	}
 }
