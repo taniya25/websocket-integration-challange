@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"github.com/Cryptovate-India/websocket-service/internal/config"
 	"github.com/Cryptovate-India/websocket-service/internal/telemetry"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -33,6 +35,10 @@ const (
 
 	// Maximum number of messages that can be queued for a client
 	maxMessageQueue = 1000
+
+	// Rate limiting constants
+	requestsPerSecond = 10
+	burstSize         = 20
 )
 
 // Client is a middleman between the websocket connection and the hub.
@@ -78,6 +84,20 @@ type WebsocketHandler struct {
 	logger           *telemetry.Logger
 	CleanupInterval  time.Duration
 	MaxMessageQueue  int
+	// Rate limiter
+	limiter *rate.Limiter
+	// Metrics
+	metrics *Metrics
+}
+
+type Metrics struct {
+	mu                sync.RWMutex
+	TotalConnections  int64
+	ActiveConnections int64
+	TotalMessages     int64
+	MessagesPerSecond int64
+	ErrorCount        int64
+	LastMinuteErrors  []time.Time
 }
 
 // NewWebsocketHandler creates a new websocket handler
@@ -113,6 +133,10 @@ func NewWebsocketHandler(ctx context.Context, cfg *config.Config) *WebsocketHand
 		logger:          telemetry.NewLogger(),
 		CleanupInterval: time.Minute,
 		MaxMessageQueue: 1000,
+		limiter:         rate.NewLimiter(rate.Limit(requestsPerSecond), burstSize),
+		metrics: &Metrics{
+			LastMinuteErrors: make([]time.Time, 0),
+		},
 	}
 
 	// Create the Delta Exchange client if enabled
@@ -132,11 +156,24 @@ func NewWebsocketHandler(ctx context.Context, cfg *config.Config) *WebsocketHand
 
 // HandleWebsocket handles a websocket connection
 func (h *WebsocketHandler) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := h.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		h.logger.LogError("connection_upgrade", err, nil)
+	// Check rate limit
+	if !h.limiter.Allow() {
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		h.recordError()
 		return
 	}
+
+	conn, err := h.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Error upgrading connection: %v", err)
+		h.recordError()
+		return
+	}
+
+	h.clientsMu.Lock()
+	h.metrics.TotalConnections++
+	h.metrics.ActiveConnections++
+	h.clientsMu.Unlock()
 
 	client := &Client{
 		conn:               conn,
@@ -622,4 +659,66 @@ func (h *WebsocketHandler) cleanupStaleConnections() {
 			return
 		}
 	}
+}
+
+func (h *WebsocketHandler) recordError() {
+	h.metrics.mu.Lock()
+	defer h.metrics.mu.Unlock()
+
+	h.metrics.ErrorCount++
+	now := time.Now()
+	h.metrics.LastMinuteErrors = append(h.metrics.LastMinuteErrors, now)
+
+	// Clean up old errors
+	cutoff := now.Add(-time.Minute)
+	for i, t := range h.metrics.LastMinuteErrors {
+		if t.After(cutoff) {
+			h.metrics.LastMinuteErrors = h.metrics.LastMinuteErrors[i:]
+			break
+		}
+	}
+}
+
+func (h *WebsocketHandler) recordMessage() {
+	h.metrics.mu.Lock()
+	defer h.metrics.mu.Unlock()
+
+	h.metrics.TotalMessages++
+	h.metrics.MessagesPerSecond++
+}
+
+func (h *WebsocketHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	h.metrics.mu.RLock()
+	defer h.metrics.mu.RUnlock()
+
+	// Calculate errors per minute
+	errorsPerMinute := len(h.metrics.LastMinuteErrors)
+
+	metrics := map[string]interface{}{
+		"total_connections":   h.metrics.TotalConnections,
+		"active_connections":  h.metrics.ActiveConnections,
+		"total_messages":      h.metrics.TotalMessages,
+		"messages_per_second": h.metrics.MessagesPerSecond,
+		"total_errors":        h.metrics.ErrorCount,
+		"errors_per_minute":   errorsPerMinute,
+		"rate_limit": map[string]interface{}{
+			"requests_per_second": requestsPerSecond,
+			"burst_size":          burstSize,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
+}
+
+// Reset metrics periodically
+func (h *WebsocketHandler) resetMetrics() {
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for range ticker.C {
+			h.metrics.mu.Lock()
+			h.metrics.MessagesPerSecond = 0
+			h.metrics.mu.Unlock()
+		}
+	}()
 }
